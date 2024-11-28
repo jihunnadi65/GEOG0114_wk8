@@ -1,6 +1,274 @@
 Week 8 Accessibility Analysis
 
 ```{r}
+library(here)
+library(usethis)
+library(tidyverse)
+library(sf)
+library(osmdata)
+library(dodgr)
+library(tmap)
+```
+```{r}
+# read poi data
+poi24 <- st_read(here::here("Dataset", "lambeth-POI-2024.gpkg"))
+```
+
+```{r}
+# read LSOA dataset
+lsoa11 <- st_read(here::here("Dataset", "london-LSOA-2011.gpkg"))
+```
+
+```{r}
+# read borough dataset
+borough <- st_read(here::here("Dataset", "London-Boroughs.gpkg"))
+```
+
+Examine individual dataframe
+
+```{r}
+# inspect individual dataframe
+head(poi24)
+head(lsoa11)
+head(borough)
+```
+
+Start by filtering out all POIs where the word `school` features in the `main_category` column
+
+```{r}
+# filter school poi data
+poi_schools <- poi24 %>% 
+  filter(str_detect(main_category, "school"))
+
+# inspect
+head(unique(poi_schools$main_category), n=50)
+```
+
+```{r}
+# remove quotes for easier processing
+poi_schools <- poi_schools %>% 
+  mutate(main_category = str_replace_all(main_category, "\"", ""))
+
+# filter school poi data
+poi_schools <- poi_schools %>% 
+  filter(main_category == "elementary_school" |
+           main_category == "high_school" |
+           main_category == "middle_school" |
+           main_category == "private_school" |
+           main_category == "public_school" |
+           main_category == "school")
+
+# filter school poi data
+lambeth <- borough %>% 
+  filter(name == "Lambeth")
+
+poi_schools <- poi_schools %>% 
+  st_intersection(lambeth) %>% 
+  select(1:11)
+
+# inspect
+poi_schools
+```
+
+We can use the `alternate_category` column to further narrow down our results
+
+```{r}
+# filter school poi data
+poi_schools <- poi_schools %>% 
+  filter(str_detect(alternate_category, "elementary_school") |
+           str_detect(alternate_category, "high_school") |
+           str_detect(alternate_category, "middle_school") |
+           str_detect(alternate_category, "private_school") |
+           str_detect(alternate_category, "public_school"))
+
+# inspect
+poi_schools
+```
+
+```{r}
+# identify duplicate postcodes
+poi_schools <- poi_schools %>% 
+  group_by(postcode) %>% 
+  mutate(rank = rank(primary_name)) %>% 
+  ungroup()
+
+# filter school poi data
+poi_schools <- poi_schools %>% 
+  filter(is.na(postcode) | rank == 1) %>% 
+  select(-rank)
+
+# inspect
+poi_schools
+```
+
+We can use a similar approach to approximate the locations of fast food outlets in the Borough
+
+```{r}
+# filter fast food poi data
+poi_fastfood <- poi24 %>% 
+  filter(str_detect(main_category, "fast_food_restaurant") | str_detect(alternate_category, "fast_food_restaurant") | str_detect(alternate_category, "chicken_restaurant") | str_detect(alternate_category, "burger_restaurant"))
+
+# inspect
+poi_fastfood
+```
+
+Map both datasets to get an idea of how the data looks like
+```{r}
+# combine for mapping
+poi_schools <- poi_schools %>% 
+  mutate(type = "School")
+poi_fastfood <- poi_fastfood %>% 
+  mutate(type = "Fast food")
+poi_lambeth <- rbind(poi_schools, poi_fastfood)
+
+tm_shape(lambeth) +
+  tm_polygons(col = "#f0f0f0") +
+tm_shape(poi_lambeth) +
+  tm_dots(col = "type", size = 0.05, palette = c("#beaed4", "#fdc086"), title = "") +
+tm_layout(legend.outside = TRUE,
+          legend.position = c("right", "bottom"),
+          frame = FALSE)
+```
+
+```{r}
+# define our bbox coordinates, use WGS84
+bbox_lambeth <- poi24 %>% 
+  st_transform(4326) %>% 
+  st_bbox()
+
+# osm query
+osm_network <- opq(bbox = bbox_lambeth) %>% 
+  add_osm_feature(key = "highway", value = c("primary", "secondary", "tertiary", "residential", "path", "footway", "unclassified", "living_street", "pedestrian")) %>% 
+  osmdata_sf()
+```
+
+```{r}
+# extract the nodes, with their osm_id
+osm_network_nodes <- osm_network$osm_points[, "osm_id"]
+
+# extract the edges, with their osm_id and relevant columns
+osm_network_edges <- osm_network$osm_lines[, c("osm_id", "name", "highway", "maxspeed", "oneway")]
+
+# inspect
+head(osm_network_nodes)
+head(osm_network_edges)
+```
+
+We can quickly map the network edges to see how the road network looks like
+
+```{r}
+tm_shape(osm_network_edges) +
+  tm_lines(
+    col = "#bdbdbd",
+    lwd = 0.2
+  ) +
+tm_shape(lambeth) +
+  tm_borders(
+    col = "#252525",
+    lwd = 2
+  ) +
+tm_add_legend(
+  type = "line",
+  labels = "Road segments",
+  col = "#bdbdbd"
+) +
+tm_add_legend(
+  type = "line",
+  labels = "Oueline Lambeth",
+  col = "#252525"
+) +
+tm_layout(
+  frame = FALSE,
+  legend.outside = TRUE,
+  legend.position = c("right", "bottom")
+)
 
 ```
+
+```{r}
+# overwrite one-way default
+osm_network_edges$oneway <- "no"
+```
+
+```{r}
+# replace missing highway tags with unclassified
+osm_network_edges <- osm_network_edges %>% 
+  mutate(highway = if_else(is.na(highway), "unclasssified", highway))
+
+# create network graph
+osm_network_graph <- weight_streetnet(osm_network_edges, wt_profile = "foot")
+```
+
+Once we have constructed our graph, we can use it to calculate network distances between our points of interest
+
+```{r}
+# extract the largest connected graph component
+netx_connected <- osm_network_graph[osm_network_graph$component == 1,]
+
+# inspect number of remaining road segments
+nrow(netx_connected)
+```
+
+Now that we have our connected subgraph, we can use the `dodgr_distance()` function to calculate the network distances between every possible origin (i.e. school) and destination (i.e. fast food outlet)
+
+```{r}
+# reproject as the dodgr package requires data to be projected in WGS84
+poi_schools <- poi_schools %>% 
+  st_transform(4326)
+poi_fastfood <- poi_fastfood %>% 
+  st_transform(4326)
+
+# distance matrix
+distance_matrix <- dodgr_distances(netx_connected, from = st_coordinates(poi_schools), to = st_coordinates(poi_fastfood), shortest = FALSE, pairwise = FALSE, quiet = FALSE)
+```
+
+The result of this computation is a distance matrix that contains the network distances between all origins (i.e. schools) and all destinations (i.e. fastfood outlets)
+
+```{r}
+# inspect
+distance_matrix[1:5, 1:5]
+```
+
+```{r}
+# fast-food outlets within 500m
+poi_schools$fastfood_500m <- rowSums(distance_matrix <= 500)
+# fast-food outlets within 1000m
+poi_schools$fastfood_1000m <- rowSums(distance_matrix <= 1000)
+```
+
+In the final step, we can invetigate whether there is a relationship between the proximity of fast-food outlets and the relative levels of deprivation in the area
+
+```{r}
+# read imd dataset
+imd19 <- read_csv(here::here("Dataset", "England-IMD-2019.csv"))
+
+imd19
+```
+
+```{r}
+# join imd
+lsoa11 <- lsoa11 %>% 
+  left_join(imd19, by = c("lsoa11cd" = "lsoa11cd"))
+
+# join schools to their parent lsoa
+poi_schools <- poi_schools %>% 
+  st_transform(27700) %>% 
+  st_join(lsoa11)
+```
+
+We can use this approach to derive the average number of fast-food by IMD decile
+
+```{r}
+# average counts by imd decile
+fastfood_imd <- poi_schools %>% 
+  group_by(imd_dec) %>% 
+  mutate(avg_cnt = mean(fastfood_1000m)) %>% 
+  distinct(imd_dec, avg_cnt) %>% 
+  arrange(imd_dec)
+
+# inspect
+fastfood_imd
+```
+
+There appears to be a weak relationship, with schools in more deprived areas having, on average, a higher number of fast-food outlets within a 1,000-metre walking distance. However, this trend is not consistent, as schools in the least deprived areas of Lambeth show the highest accessibility on average.
 
